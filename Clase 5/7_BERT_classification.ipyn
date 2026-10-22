@@ -1,0 +1,465 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Clasificación de sentimiento con BERT\n",
+    "### Enfoque 3 de 3 — Fine-tuning completo de BERT\n",
+    "\n",
+    "**Universidad de Santiago de Chile (USACH)**  \n",
+    "Diplomado de Inteligencia artificial aplicada a la industria tecnológica  \n",
+    "Autor: Diego Fischer\n",
+    "\n",
+    "Se hace **fine-tuning completo de BERT** (`trainable=True`): sus pesos se ajustan y sobre el vector `[CLS]` (`pooled_output`) se añade una capa densa. Con KerasHub usamos `keras_hub.models.BertBackbone` entrenable (o, en una línea, `keras_hub.models.BertTextClassifier`).\n",
+    "\n",
+    "> Los tres cuadernos de esta serie resuelven la misma tarea (clasificación binaria de sentimiento sobre el dataset Sentiment140) y se diferencian únicamente en el rol que cumple BERT dentro del modelo.\n",
+    "\n",
+    "> **Migrado a KerasHub.** El paquete `bert-for-tf2` quedó obsoleto y no funciona con Keras 3 (el *default* en Colab actual). Aquí usamos [KerasHub](https://keras.io/keras_hub/), la biblioteca nativa de Keras 3 para modelos preentrenados.\n",
+    "\n",
+    "---"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Fase 1: Importar las dependencias"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Instalamos **KerasHub**. Requiere Keras 3, que ya viene por defecto en Colab, así que no hace falta reiniciar el entorno."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "!pip install -q -U keras-hub"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Importamos las librerías. Fijamos TensorFlow como *backend* de Keras 3 **antes** de importar `keras`. `keras_hub` nos da el tokenizador y el modelo BERT preentrenados."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "os.environ[\"KERAS_BACKEND\"] = \"tensorflow\"   # backend de Keras 3\n",
+    "\n",
+    "import numpy as np\n",
+    "import math\n",
+    "import re\n",
+    "import pandas as pd\n",
+    "from bs4 import BeautifulSoup\n",
+    "import random\n",
+    "\n",
+    "import tensorflow as tf\n",
+    "import keras\n",
+    "import keras_hub\n",
+    "from tensorflow.keras import layers\n",
+    "\n",
+    "from google.colab import drive\n",
+    "\n",
+    "# Preset de BERT preentrenado (equivalente a bert_en_uncased_L-12_H-768_A-12)\n",
+    "BERT_PRESET = \"bert_base_en_uncased\""
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Montamos Google Drive para leer el dataset."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "drive.mount(\"/content/drive\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Fase 2: Preprocesamiento de datos"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Carga de los ficheros"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Leemos el CSV de entrenamiento de Sentiment140 (seis columnas; `encoding='latin1'` por los caracteres no UTF-8 de los tweets)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "cols = [\"sentiment\", \"id\", \"date\", \"query\", \"user\", \"text\"]\n",
+    "data = pd.read_csv(\n",
+    "    \"/content/drive/My Drive/Curso de NLP/BERT/sentiment_data/training.csv\",\n",
+    "    header=None,\n",
+    "    names=cols,\n",
+    "    engine=\"python\",\n",
+    "    encoding=\"latin1\"\n",
+    ")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Conservamos solo las columnas útiles: `sentiment` y `text`."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "data.drop([\"id\", \"date\", \"query\", \"user\"], axis=1, inplace=True)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Limpieza"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Función que limpia cada tweet: quita el HTML, las menciones `@usuario`, las URLs y todo lo que no sean letras o signos básicos, y colapsa los espacios sobrantes."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "def clean_tweet(tweet):\n",
+    "    tweet = BeautifulSoup(tweet, \"lxml\").get_text()\n",
+    "    # Eliminar el @ y su mención\n",
+    "    tweet = re.sub(r\"@[A-Za-z0-9]+\", ' ', tweet)\n",
+    "    # Eliminar los links de la URL\n",
+    "    tweet = re.sub(r\"https?://[A-Za-z0-9./]+\", ' ', tweet)\n",
+    "    # Conservar solo las letras y algunos signos\n",
+    "    tweet = re.sub(r\"[^a-zA-Z.!?']\", ' ', tweet)\n",
+    "    # Eliminar espacios en blanco adicionales\n",
+    "    tweet = re.sub(r\" +\", ' ', tweet)\n",
+    "    return tweet"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Aplicamos la limpieza a todos los tweets."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "data_clean = [clean_tweet(tweet) for tweet in data.text]"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Extraemos las etiquetas. En Sentiment140 el positivo viene como `4`; lo pasamos a `1` para tener etiquetas binarias **0 (negativo)** / **1 (positivo)**."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "data_labels = data.sentiment.values\n",
+    "data_labels[data_labels == 4] = 1"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Tokenización y empaquetado"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Igual que en el enfoque anterior, usamos el preprocesador de BERT para obtener `{token_ids, segment_ids, padding_mask}` a longitud fija."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "SEQ_LEN = 40\n",
+    "preprocessor = keras_hub.models.BertTextClassifierPreprocessor.from_preset(\n",
+    "    BERT_PRESET, sequence_length=SEQ_LEN)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Creación del dataset"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Armamos el `tf.data.Dataset` y separamos entrenamiento/prueba."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "BATCH_SIZE = 32\n",
+    "AUTOTUNE = tf.data.AUTOTUNE\n",
+    "\n",
+    "full_ds = tf.data.Dataset.from_tensor_slices((data_clean, data_labels))\n",
+    "full_ds = full_ds.shuffle(len(data_clean), seed=42)\n",
+    "\n",
+    "NB_TEST = len(data_clean) // 10\n",
+    "\n",
+    "def make_ds(ds):\n",
+    "    return (ds.batch(BATCH_SIZE)\n",
+    "              .map(lambda x, y: (preprocessor(x), y), num_parallel_calls=AUTOTUNE)\n",
+    "              .prefetch(AUTOTUNE))\n",
+    "\n",
+    "test_dataset  = make_ds(full_ds.take(NB_TEST))\n",
+    "train_dataset = make_ds(full_ds.skip(NB_TEST))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "> El *fine-tuning* de BERT es **caro**: ajusta los ~110 M de parámetros del modelo. Sobre 1,6 M de tweets tardaría muchísimo, así que entrenamos sobre un subconjunto reducido (como en el cuaderno original)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "train_dataset_light = train_dataset.take(500)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Fase 3: Construcción del modelo"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Tomamos el `pooled_output` de BERT (el vector `[CLS]`, un resumen de toda la oración), le aplicamos *dropout* y una capa densa que entrega los *logits* de las 2 clases. Aquí **BERT es entrenable** (`trainable=True` por defecto), así que sus pesos se ajustan al problema.\n",
+    "\n",
+    "> Alternativa en una línea: KerasHub trae un clasificador BERT completo, `keras_hub.models.BertTextClassifier.from_preset(BERT_PRESET, num_classes=2)`, que hace exactamente esto (backbone + cabeza). Lo escribimos explícito para ver las partes."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "class BERTClassifier(tf.keras.Model):\n",
+    "    def __init__(self, bert_preset, nb_classes=2, dropout_rate=0.1,\n",
+    "                 name=\"bert_classifier\"):\n",
+    "        super().__init__(name=name)\n",
+    "        self.bert = keras_hub.models.BertBackbone.from_preset(bert_preset)  # entrenable\n",
+    "        self.dropout = layers.Dropout(dropout_rate)\n",
+    "        self.last_dense = layers.Dense(nb_classes)   # logits (sin softmax)\n",
+    "\n",
+    "    def call(self, inputs, training=False):\n",
+    "        pooled = self.bert(inputs)[\"pooled_output\"]   # (batch, 768) -> vector [CLS]\n",
+    "        pooled = self.dropout(pooled, training=training)\n",
+    "        return self.last_dense(pooled)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Fase 4: Entrenamiento"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Compilamos con Adam y una tasa de aprendizaje baja (5e-5), la recomendada para *fine-tuning* de BERT. Como la última capa entrega *logits*, usamos `from_logits=True`."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "NB_CLASSES = 2\n",
+    "DROPOUT_RATE = 0.1\n",
+    "NB_EPOCHS = 5\n",
+    "INIT_LR = 5e-5\n",
+    "\n",
+    "bert_classifier = BERTClassifier(BERT_PRESET, nb_classes=NB_CLASSES,\n",
+    "                                 dropout_rate=DROPOUT_RATE)\n",
+    "\n",
+    "bert_classifier.compile(\n",
+    "    optimizer=keras.optimizers.Adam(INIT_LR),\n",
+    "    loss=keras.losses.SparseCategoricalCrossentropy(from_logits=True),\n",
+    "    metrics=[keras.metrics.SparseCategoricalAccuracy()])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Guardamos los pesos en Drive por época."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "checkpoint_path = \"/content/drive/My Drive/Curso de NLP/BERT/ckpt_bert_class.weights.h5\"\n",
+    "ckpt_cb = keras.callbacks.ModelCheckpoint(checkpoint_path, save_weights_only=True)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Entrenamos sobre el subconjunto reducido."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "bert_classifier.fit(train_dataset_light, epochs=NB_EPOCHS, callbacks=[ckpt_cb])"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Fase 5: Evaluación"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "bert_classifier.evaluate(test_dataset)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "Probamos con una frase nueva. La salida son *logits*; la clase es el `argmax`."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "def get_prediction(sentence):\n",
+    "    inputs = preprocessor([sentence])\n",
+    "    logits = bert_classifier(inputs, training=False)\n",
+    "    sentiment = int(tf.argmax(tf.squeeze(logits)).numpy())\n",
+    "    etiqueta = \"Positivo\" if sentiment == 1 else \"Negativo\"\n",
+    "    print(\"Logits: {}\\nSentimiento predicho: {}.\".format(logits.numpy(), etiqueta))\n",
+    "\n",
+    "get_prediction(\"I love being with you\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "## Licencia\n",
+    "\n",
+    "[![Licencia Creative Commons](https://i.creativecommons.org/l/by/4.0/88x31.png)](https://creativecommons.org/licenses/by/4.0/deed.es)\n",
+    "\n",
+    "Esta obra está licenciada bajo una [Licencia Creative Commons Atribución 4.0 Internacional (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/deed.es).\n",
+    "\n",
+    "**Atribución:** Diego Fischer — Universidad de Santiago de Chile (USACH)."
+   ]
+  }
+ ],
+ "metadata": {
+  "accelerator": "GPU",
+  "colab": {
+   "provenance": []
+  },
+  "kernelspec": {
+   "name": "python3",
+   "display_name": "Python 3"
+  },
+  "language_info": {
+   "name": "python"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 0
+}
